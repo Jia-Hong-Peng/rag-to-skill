@@ -18,7 +18,7 @@ description: |
 
 # PDF OCR → JSONL（Claude Code Vision）
 
-> 使用 Claude Code 的 Read tool 視覺能力逐頁辨識掃描 PDF，輸出 rag-to-skill 相容的 JSONL 格式。
+> 使用 Claude Code 的視覺能力逐頁辨識掃描 PDF，輸出 rag-to-skill 相容的 JSONL 格式。
 
 ---
 
@@ -38,9 +38,7 @@ description: |
 
 ---
 
-## 執行流程
-
-### Step 0：前置檢查
+## Step 0：前置檢查
 
 1. 確認 `PDF_PATH` 存在
 2. 若 `OUTPUT_PATH` 未指定，設為 `PDF_PATH` 同目錄、副檔名換成 `.jsonl`
@@ -52,7 +50,7 @@ description: |
 
 ---
 
-### Step 1：提取頁面圖片
+## Step 1：提取頁面圖片
 
 執行 extract_pages.py 把 PDF 轉成 PNG 圖片：
 
@@ -68,7 +66,7 @@ python3 ~/.claude/skills/pdf-ocr/extract_pages.py \
 
 ---
 
-### Step 2：決定本次 batch 範圍
+## Step 2：決定本次 batch 範圍
 
 ```
 已完成 = PROGRESS.completed_pages（整數 list，0-based）
@@ -82,16 +80,61 @@ python3 ~/.claude/skills/pdf-ocr/extract_pages.py \
 
 ---
 
-### Step 3：逐頁 OCR
+## Step 3：逐頁 OCR
+
+**第一步：偵測當前模型**
+
+讀取 `~/.claude/settings.json`，取出 `"model"` 欄位值。
+
+- 若值為 `"MiniMax-M2.7"`（或其開頭為 `MiniMax`）→ 使用 **MCP 模式**
+- 若為其他模型（sonnet、opus、haiku 等）→ 使用 **Read tool 模式**
+
+---
+
+### 模式 A：MCP 模式（MiniMax-M2.7）
+
+MiniMax-M2.7 不支援直接讀取圖片，但可透過 MCP `understand_image` 工具讀圖。
 
 對 `本次 batch` 中的每一頁 `page_idx`（0-based）：
 
-**3a. 讀取圖片**
+**3A-a. 呼叫 MCP understand_image**
+
+使用 `claude --print` 搭配 MCP 工具：
+
+```bash
+claude --print --model MiniMax-M2.7 \
+  "使用 MCP 工具 understand_image 讀取本機圖片 {PNG_DIR}/page_{page_idx:04d}.png，回答圖片中的所有文字內容，逐字轉錄，用繁中輸出"
+```
+
+**3A-b. 解析輸出**
+
+從 stdout 取出回覆文字，即為該頁轉錄內容。
+
+**3A-c. 判斷頁面類型並轉錄**
+
+| 類型 | 判斷標準 | 處理方式 |
+|---|---|---|
+| 空白 / 封面 / 純裝飾圖 | 幾乎無文字、無知識性內容 | 略過（不寫入 records），記錄 `skip=true` |
+| 章節標題頁 | 有明顯大標題（居中、字體大、第X章 等） | 更新 `current_chapter`，`item_index +1` |
+| 一般文字頁 | 有連續文字段落 | 轉錄原文 |
+| 有意義的圖示頁 | 流程圖、表格圖、命盤範例等 | 以文字模擬表格格式還原（見下方表格處理說明） |
+
+**MCP 模式表格處理原則**：
+- 使用 MCP `understand_image` 時，prompt 應要求：「以固定寬度文字表格或 Markdown 表格格式還原」
+- 若模型輸出為敘述句而非表格格式，在轉錄文字中手動整理為表格
+
+**3A-d. 切 chunks 與建立 records**：同下方通用規則。
+
+---
+
+### 模式 B：Read tool 模式（非 MiniMax 模型）
+
+對 `本次 batch` 中的每一頁 `page_idx`（0-based）：
+
+**3B-a. 讀取圖片**
 用 Read tool 讀取：`{PNG_DIR}/page_{page_idx:04d}.png`
 
-**3b. 判斷頁面類型並轉錄**
-
-用以下標準判斷：
+**3B-b. 判斷頁面類型並轉錄**
 
 | 類型 | 判斷標準 | 處理方式 |
 |---|---|---|
@@ -100,29 +143,33 @@ python3 ~/.claude/skills/pdf-ocr/extract_pages.py \
 | 一般文字頁 | 有連續文字段落 | 轉錄原文 |
 | 有意義的圖示頁 | 頁面主體為圖片，但含知識性內容（流程圖、表格圖、示意圖、教學插圖、命盤範例圖等） | 以文字描述圖片傳達的知識重點（見下方說明） |
 
-**有意義的圖示頁：處理方式**
+**Read tool 模式圖示頁處理方式**
 
 不要 SKIP。用你對圖片的理解，以文字描述這張圖所傳達的核心知識或資訊，格式如下：
 
 ```
 【圖示說明】<一句話說明圖的類型，例如：流程圖、命盤範例、對照表>
-<描述圖中的主要內容、結構、或所表達的概念重點，2–5 句話>
+<描述圖中的主要內容、结构、或所表達的概念重點，2–5 句話>
 <若圖中有關鍵數字、名詞、步驟順序，請明確列出>
 ```
 
-判斷「有意義」的標準：
+---
+
+### 通用轉錄規則（兩種模式皆適用）
+
+**判斷「有意義」的標準：**
 - 流程圖、步驟圖：含有箭頭或順序關係，說明某個操作或推導過程
 - 表格圖：含有比較、對應、分類等結構性資訊 → 以**固定寬度文字表格**或 **Markdown 表格**格式還原表達，不要只用純敘述句
 - 教學示意圖：幫助理解正文概念的插圖（例如命盤結構圖、星曜分佈圖）
 - 範例命盤或範例圖表：含有具體數值或實例，幫助讀者理解上下文
 
-判斷「裝飾性，應 SKIP」的標準：
+**判斷「裝飾性，應 SKIP」的標準：**
 - 純底色或底紋頁
 - 章節分隔裝飾頁（無文字、無資訊）
 - 封面、封底、版權頁（無知識性內容）
 - 作者照片、風景照等無內容關聯的圖片
 
-轉錄原則：
+**轉錄原則：**
 - 完整逐字轉錄，保留標點符號
 - 若一頁同時有標題和正文，先記錄章節名，再轉錄正文
 - 頁碼、書名行等重複性 header/footer 可省略
@@ -157,7 +204,7 @@ python3 ~/.claude/skills/pdf-ocr/extract_pages.py \
 
 ---
 
-### Step 4：回報進度
+## Step 4：回報進度
 
 每處理完 5 頁，輸出一行進度：
 ```
@@ -166,7 +213,7 @@ python3 ~/.claude/skills/pdf-ocr/extract_pages.py \
 
 ---
 
-### Step 5：寫出 JSONL
+## Step 5：寫出 JSONL
 
 本次 batch 全部完成後（或全部頁面完成後），從 `PROGRESS.records` 寫出 JSONL：
 
@@ -182,7 +229,7 @@ with open(OUTPUT_PATH, 'w', encoding='utf-8') as f:
 
 ---
 
-### Step 6：結束回報
+## Step 6：結束回報
 
 **若還有剩餘頁面**：
 ```
@@ -226,7 +273,9 @@ with open(OUTPUT_PATH, 'w', encoding='utf-8') as f:
 
 ## 注意事項
 
+- **MCP 模式（MCP `understand_image`）：** MiniMax-M2.7 不支援直接 Vision，必須透過 MCP `understand_image` 工具。需已執行 `claude mcp add -s user MiniMax --env MINIMAX_API_KEY=... --env MINIMAP_API_HOST=https://api.minimax.io -- uvx minimax-coding-plan-mcp -y`
+- **Read tool 模式：** 其他模型（sonnet、opus、haiku 等）直接用 Read tool 讀取 PNG
 - 每次最多處理 BATCH_SIZE 頁（預設 30），超過會因 context 過大影響品質
 - PNG 暫存目錄在全部完成後自動刪除；中途 session 結束不影響（下次 --resume 時重新提取）
-- 若某頁 Read tool 讀圖失敗，記錄為 `skip=true` 並繼續
+- 若某頁讀圖失敗，記錄為 `skip=true` 並繼續
 - DPI 100 適合一般中文書籍；手寫或模糊頁面建議 --dpi 150
