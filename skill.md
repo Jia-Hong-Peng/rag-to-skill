@@ -44,8 +44,8 @@ description: |
 | `pdf_ocr_to_jsonl.py` | **掃描版 PDF**（無文字層，LLM Vision OCR） | `python3 pdf_ocr_to_jsonl.py <file.pdf>` |
 
 腳本位置：`~/.claude/skills/rag-to-skill/`（或同 repo 根目錄）。
-依賴：`pip install markitdown`（any）、`pip install pymupdf`（pdf/ocr）、`pip install anthropic`（ocr）、`pip install ebooklib beautifulsoup4`（epub）。
-OCR 額外需要：`export ANTHROPIC_API_KEY=sk-ant-...`；先執行 `--dry-run` 估算費用。
+依賴：`pip install markitdown`（any）、`pip install pymupdf`（pdf/ocr）、`pip install ebooklib beautifulsoup4`（epub）。
+OCR：使用 Claude Code Read tool 視覺能力，**不需要** Anthropic API key，不使用任何 MCP。
 
 ---
 
