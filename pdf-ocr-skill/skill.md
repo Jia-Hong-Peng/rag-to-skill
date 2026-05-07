@@ -6,7 +6,7 @@ description: |
   - 掃描型：用 LLM 視覺能力（Read / view_image）逐頁辨識
   嚴禁任何傳統 OCR 引擎（Tesseract / PaddleOCR / EasyOCR）、雲端 OCR API、MCP 圖像工具。
   一次只做一本書（單機鎖），完成後清除所有暫存（PNG 與 progress 檔）。
-  每次最多處理一個 batch（預設 30 頁），支援 --resume。
+  每次最多處理一個 batch（預設 8 頁），支援 --resume；長時間任務必須採用低上下文 append-only 流程。
   觸發時機：
   - 使用者說「OCR 這個 PDF」
   - 使用者說「把掃描 PDF 做成 JSONL」
@@ -16,7 +16,7 @@ description: |
   - /pdf-ocr /path/to/book.pdf
   - /pdf-ocr /path/to/book.pdf /path/to/output.jsonl
   - /pdf-ocr /path/to/book.pdf --resume
-  - /pdf-ocr /path/to/book.pdf --batch 20 --dpi 120
+  - /pdf-ocr /path/to/book.pdf --batch 8 --dpi 120
 ---
 
 # PDF → JSONL（智慧路由：文字型直取 / 掃描型 LLM Vision）
@@ -31,6 +31,23 @@ description: |
 ---
 
 ## 強制規則（Hard Rules — 違反即任務失敗）
+
+### 0. Guard Hook 機制（強制使用）
+
+本 skill 內建 `pdf_ocr_guard.py` 作為可執行的 guard hook。Codex/Claude 目前不會自動在每個 shell tool call 前注入 skill hook，因此使用本 skill 時必須在下列檢查點**手動執行 guard**；少跑任一檢查即視為流程不完整：
+
+| 檢查點 | 必跑指令 | 目的 |
+|---|---|---|
+| 啟動前 | `python3 ~/.codex/skills/pdf-ocr/pdf_ocr_guard.py check-single-book --current-output "<OUTPUT_PATH>"` | 阻止同時處理多本書 |
+| 啟動/續跑前 | `python3 ~/.codex/skills/pdf-ocr/pdf_ocr_guard.py check-existing-jsonl "<OUTPUT_PATH>"` | 阻止沿用污染 JSONL |
+| 續跑前 | `python3 ~/.codex/skills/pdf-ocr/pdf_ocr_guard.py validate-progress "<PROGRESS_FILE>"` | 阻止沿用高上下文舊 progress |
+| 每次準備執行 shell 命令前 | `python3 ~/.codex/skills/pdf-ocr/pdf_ocr_guard.py check-command -- <COMMAND...>` | 阻止 Tesseract/Paddle/EasyOCR/雲端 OCR/MCP 圖像工具 |
+| 渲染後 | `python3 ~/.codex/skills/pdf-ocr/pdf_ocr_guard.py write-manifest "<PDF_PATH>" "<OUTPUT_PATH>" --png-dir "<PNG_DIR>"` | 保存 PDF/頁圖 SHA256 證據 |
+| 寫出 JSONL 後 | `python3 ~/.codex/skills/pdf-ocr/pdf_ocr_guard.py validate-jsonl "<OUTPUT_PATH>"` | 驗證 source、頁序、record 序 |
+| 完成前 | `python3 ~/.codex/skills/pdf-ocr/pdf_ocr_guard.py finalize-audit "<OUTPUT_PATH>" --total-pages <TOTAL>` | 產生 final hash chain |
+| 刪 PDF 前 | `python3 ~/.codex/skills/pdf-ocr/pdf_ocr_guard.py deletion-gate "<OUTPUT_PATH>" --total-pages <TOTAL> --keep-pages` | 確認可刪 PDF 的條件 |
+
+Claude Code 安裝位置若是 `~/.claude/skills/pdf-ocr/`，同一套指令改用該路徑。
 
 ### A. 永不允許的辨識方式
 
@@ -60,10 +77,15 @@ description: |
 
 ```json
 {
+  "record_index": 0,
+  "page_index": 0,
+  "page_number": 1,
+  "page_record_index": 0,
   "loc": {"item_index": 0, "chunk_index": 0},
   "chapter": "第一章：命宮",
   "text": "...",
-  "source": "llm_vision"
+  "source": "llm_vision",
+  "page_sha256": "<該頁 PNG 的 SHA256>"
 }
 ```
 
@@ -72,6 +94,21 @@ description: |
 - `"pdf_text_layer"`（文字型 PDF 走 PyMuPDF 抽文字）
 
 任何其他值（`tesseract`, `paddleocr`, `chi_tra_vert`, `mcp_minimax`, `manual` 等）即視為違規輸出，**整批作廢重做**，不可只修補單筆。
+
+### C2. 頁序與忠實性欄位（Hard Audit）
+
+為避免 append 亂序、漏頁、重複頁、上下文壓縮失憶或 worker 偷吃步，每筆 JSONL 必須滿足：
+
+| 欄位 | 規則 |
+|---|---|
+| `record_index` | 全檔從 0 開始，逐筆 +1，不可跳號、重複或倒退 |
+| `page_index` | 0-based PDF 頁碼，必須單調不倒退 |
+| `page_number` | 必須等於 `page_index + 1` |
+| `page_record_index` | 同一頁內從 0 開始逐筆 +1 |
+| `page_sha256` | LLM Vision 路徑必填，等於該頁 PNG 在 manifest 中的 SHA256 |
+| `text` | 必須是逐字轉錄或圖示忠實描述；不可摘要、補寫、推測 |
+
+每頁即使 SKIP，也要寫一筆 `skip:true` record，包含 `skip_reason`、`page_index`、`page_number`、`page_sha256`。這樣 `validate-coverage` 才能證明整本每一頁都被看過。
 
 ### D. 既有 JSONL 完整性檢查（Step 0 強制執行）
 
@@ -95,6 +132,15 @@ description: |
 - `easyocr`, `cnocr`, `ocrmypdf`
 - 雲端 OCR CLI：`gcloud vision`, `aws textract`, `az cognitiveservices vision`, `aliyun ocr`, `tencent ocr`
 
+每次準備執行 shell 命令前，先用 guard 檢查完整命令字串：
+
+```bash
+python3 ~/.codex/skills/pdf-ocr/pdf_ocr_guard.py check-command -- \
+  python3 ~/.codex/skills/pdf-ocr/detect_pdf_type.py "<PDF_PATH>"
+```
+
+若 guard 輸出 `BLOCKED:` 或非 0 exit code，必須停止，不可改寫命令繞過。
+
 如使用者明確要求改用上述工具，禮貌拒絕並說明本 skill 唯一支援文字直取 / LLM Vision；使用者堅持，請使用者離開本 skill 自行處理。
 
 ### F. 一次只做一本書（單機鎖機制）
@@ -113,15 +159,86 @@ description: |
 
 ### G. 完成後清除暫存（強制執行）
 
-全部頁面 OCR 完成（Step 6 寫出最終 JSONL）後，必須：
+全部頁面 OCR 完成（Step 6 寫出最終 JSONL）後，必須先完成 `finalize-audit`。PNG 是否刪除取決於 PDF 保存策略：
 
 1. 刪除 PROGRESS_FILE：`{OUTPUT_PATH}.ocr-progress.json`
-2. 刪除 PNG 暫存目錄：`/tmp/pdf-ocr-xxxxxxxx/`（含其下所有 `page_*.png`）
-3. 確認 `/tmp/pdf-ocr-*/` 不再有此次任務殘留
-4. 回報「✅ 暫存已清除」
+2. 若保留原始 PDF，才可刪除 PNG 暫存目錄：`/tmp/pdf-ocr-xxxxxxxx/`
+3. 若準備刪 PDF，必須先把 PNG 移到正式 archive/workdir，不可刪 PNG
+4. 確認本次任務沒有未審計暫存
+5. 回報「✅ 暫存/證據保存策略已完成」
 
 > 使用者只應拿到輸出的 JSONL 檔案，不該看到 progress 或 PNG 殘留。
 > 文字直取路徑沒有 PNG 暫存，仍須確認沒生出多餘檔案。
+
+### H. 長時間上下文控制（10 小時任務強制）
+
+掃描型 LLM Vision OCR 可能跑數小時到十多小時。為避免主上下文滿出、壓縮後遺失狀態，必須遵守：
+
+1. **不可把整本 records 放進對話或 progress**：`PROGRESS_FILE` 只保存狀態，不保存全文 records。
+2. **JSONL 採 append-only**：每完成一頁，立即把該頁 records 追加到 `OUTPUT_PATH`，再更新 `completed_pages`。
+3. **主上下文只保留控制資訊**：PDF 路徑、輸出路徑、總頁數、已完成頁數、目前章節、下一批頁碼、最近 1-3 筆短摘要。不要貼整頁 OCR 文字回主對話。
+4. **預設 batch 降為 8 頁**：一般書籍用 `--batch 8`；密集古籍、直書、表格多時用 `--batch 3` 到 `--batch 5`。
+5. **每 60-90 分鐘做一次 checkpoint**：執行 `validate-jsonl`，回報完成頁數與剩餘頁數即可，不貼內容。
+6. **上下文壓縮前後可恢復**：恢復工作只依賴 `OUTPUT_PATH`、`PROGRESS_FILE`、`PNG_DIR`，不可依賴對話裡的未落盤內容。
+7. **每個 batch 前讀取最後狀態**：worker 必須從 `PROGRESS_FILE` 與 `OUTPUT_PATH` 最後一筆取得 `record_index`、`current_chapter`、`item_chunk_counts`，不可憑對話記憶續接。
+8. **每個 batch 後做硬驗證**：必跑 `validate-jsonl`；失敗即停止，不可繼續 append。
+9. **正式 artifact 不可覆寫**：page artifact、batch manifest、run manifest、final report、deletion report 都用 run id/generation id；重試時產生新 generation，不覆寫舊正式檔。
+10. **原子寫入**：所有正式 JSON artifact 必須先寫 `*.tmp`，flush/fsync 後 atomic rename，再 fsync parent directory。
+
+#### Subagent / Fresh Worker 模式（建議用於長時間 OCR）
+
+若平台支援 subagent，掃描型 OCR 應使用「每 batch 一個 fresh worker」：
+
+- 主 agent 只負責：前置檢查、渲染 PNG、分配頁碼、驗證 JSONL、清理暫存。
+- worker agent 負責：讀取本批 PNG、用 LLM Vision 轉錄、append JSONL、更新 progress。
+- worker 必須是**全新上下文**：不要 fork 主對話全文；只傳必要任務包。
+- 每個 worker 完成後關閉；下一批重新開新 worker，避免同一個 worker 累積十小時上下文。
+- 不要平行開多個 worker 處理同一本書。單書仍然串行，避免章節狀態與 chunk index 競爭。
+
+worker 任務包只包含：
+
+```text
+使用 pdf-ocr skill 的 LLM Vision 路徑。禁止 Tesseract/Paddle/EasyOCR/雲端 OCR/MCP 圖像工具。
+PDF_PATH=<...>
+OUTPUT_PATH=<...>
+PROGRESS_FILE=<...>
+PNG_DIR=<...>
+PAGE_RANGE=<start-end, 1-based>
+CURRENT_CHAPTER=<...>
+CURRENT_ITEM_INDEX=<...>
+ITEM_CHUNK_COUNTS=<...>
+NEXT_RECORD_INDEX=<從 OUTPUT_PATH 最後一筆 + 1 得出>
+請逐頁 view_image/Read PNG，轉錄後 append JSONL；每頁完成立刻更新 progress。
+回覆只給：完成頁數、records 數、最後章節、是否有異常。不要貼全文。
+```
+
+Codex 可用 `spawn_agent`，設定 `fork_context:false`，agent type 用 `worker`；Claude Code 若沒有等效能力，則用短 batch + `--resume` 重啟新會話達到同樣目的。
+
+### I. 原始資料保存與刪除限制
+
+**在 JSONL 完成後立刻刪 PDF 是高風險操作，預設禁止。** 因為 JSONL 是衍生資料，不等同原始掃描證據。若真的需要刪除 PDF，必須先完成以下全部條件：
+
+1. 產生 `{OUTPUT_PATH}.manifest.json`，包含原始 PDF SHA256、每頁 PNG SHA256、輸出 JSONL 路徑、`total_pages`。
+2. 完成 `finalize-audit`，產生 `{OUTPUT_PATH}.final-report.json`。
+3. 至少保留以下二選一：
+   - 原始 PDF；或
+   - 每頁 PNG + manifest + JSONL。
+4. 執行 `deletion-gate`；若 PDF 與 PNG 都要刪除，guard 必須拒絕，且不可宣稱可審計。
+
+最佳實務：把原始 PDF 移到 `archive/` 或冷儲存，不要刪除；若要節省空間，優先刪 `/tmp/pdf-ocr-*` PNG，保留 PDF + JSONL + manifest。
+
+### J. 95 分模式：Artifact / Hash Chain / Lease
+
+若目標是 24 小時長跑後允許刪 PDF，必須啟用 95 分模式：
+
+1. **正式 workdir**：使用 `<OUTPUT>.ocr-work/`，不要把唯一頁圖證據放 `/tmp`。
+2. **page artifact**：worker 不直接 append 最終 JSONL；每頁先產生 `pages_ocr/page_000001.g0001.ocr.json`。
+3. **batch manifest**：每 batch 產生 `batch_manifest.json`，列出 page artifact SHA256、worker id、lease token、generation。
+4. **central state**：主 agent 維護 run state，worker 只提交 completion manifest，不直接宣告全域完成。
+5. **lease token**：每個 batch 有 lease token、created_at、expires_at；逾期後只能用新 generation 重試。
+6. **canonical assembler**：最終 JSONL 只能由 deterministic assembler 依 `page_index ASC, page_record_index ASC` 組裝，`record_index` 由 assembler 產生。
+7. **hash chain**：page artifact hash -> batch manifest hash -> run manifest hash -> final report hash -> deletion report hash。
+8. **QA layer**：文字正確性不能由 hash 證明；必須標記低信心頁、抽樣人工審查或第二 pass 差異審查。
 
 ---
 
@@ -132,9 +249,10 @@ description: |
 | `PDF_PATH` | PDF 檔案路徑（必要） | — |
 | `OUTPUT_PATH` | 輸出 JSONL 路徑（選用） | PDF 同目錄 + .jsonl |
 | `--resume` | 從上次中斷點繼續 | false |
-| `--batch N` | 每次最多處理頁數（僅 LLM Vision 路徑） | 30 |
+| `--batch N` | 每次最多處理頁數（僅 LLM Vision 路徑） | 8 |
 | `--dpi N` | 圖片渲染解析度（僅 LLM Vision 路徑） | 120 |
 | `--force-ocr` | 強制走 LLM Vision，跳過文字型偵測 | false |
+| `--long-run` | 啟用長時間低上下文模式：batch 預設 8、append-only、可用 fresh worker | true |
 
 **PROGRESS_FILE** = `OUTPUT_PATH + ".ocr-progress.json"`
 
@@ -144,8 +262,21 @@ description: |
 
 1. 確認 `PDF_PATH` 存在
 2. 若 `OUTPUT_PATH` 未指定，設為 `PDF_PATH` 同目錄、副檔名換成 jsonl
-3. **§F 單機鎖檢查**：掃描 `/tmp/pdf-ocr-*` 與既有 `*.ocr-progress.json`，若有未完成任務 → 依 §F 處理
-4. **§D 既有 JSONL 完整性驗證**：若 `OUTPUT_PATH` 已存在，讀第一筆檢查 `source` 欄位
+3. **Guard：單機鎖檢查**：
+   ```bash
+   python3 ~/.codex/skills/pdf-ocr/pdf_ocr_guard.py check-single-book --current-output "<OUTPUT_PATH>"
+   ```
+   若有未完成任務 → 依 §F 處理
+4. **Guard：既有 JSONL 完整性驗證**：
+   ```bash
+   python3 ~/.codex/skills/pdf-ocr/pdf_ocr_guard.py check-existing-jsonl "<OUTPUT_PATH>"
+   ```
+   若 `OUTPUT_PATH` 已存在且 `source` 不合法，視為污染，不可 `--resume`
+5. **Guard：progress 狀態檔驗證**：
+   ```bash
+   python3 ~/.codex/skills/pdf-ocr/pdf_ocr_guard.py validate-progress "<OUTPUT_PATH>.ocr-progress.json"
+   ```
+   若 progress 內含完整 `records`，代表是舊版高上下文格式；必須先遷移或重建 progress，不可直接續跑
 
 ---
 
@@ -154,10 +285,11 @@ description: |
 在啟動任何 PNG 渲染或 LLM Vision 前，必須先判斷 PDF 是文字型還是掃描型：
 
 ```bash
-# Claude Code：
-python3 ~/.claude/skills/pdf-ocr/detect_pdf_type.py "<PDF_PATH>"
+# 先做 shell 命令 guard
+python3 ~/.codex/skills/pdf-ocr/pdf_ocr_guard.py check-command -- \
+  python3 ~/.codex/skills/pdf-ocr/detect_pdf_type.py "<PDF_PATH>"
 
-# Codex：
+# 再執行偵測
 python3 ~/.codex/skills/pdf-ocr/detect_pdf_type.py "<PDF_PATH>"
 ```
 
@@ -186,6 +318,7 @@ records = []
 current_chapter = "（前言）"
 current_item_index = 0
 chunk_counts = {}
+record_index = 0
 
 CHAPTER_RE = re.compile(r'(第[一二三四五六七八九十百千零〇\d]+[章節篇回卷]|序|前言|目[錄录]|附[錄录])')
 
@@ -202,14 +335,19 @@ for page_idx, page in enumerate(doc):
     chunks = chunk_text(text, max_chars=500)
     ck = str(current_item_index)
     chunk_counts.setdefault(ck, 0)
-    for chunk in chunks:
+    for page_record_index, chunk in enumerate(chunks):
         records.append({
+            "record_index": record_index,
+            "page_index": page_idx,
+            "page_number": page_idx + 1,
+            "page_record_index": page_record_index,
             "loc": {"item_index": current_item_index, "chunk_index": chunk_counts[ck]},
             "chapter": current_chapter,
             "text": chunk,
             "source": "pdf_text_layer"
         })
         chunk_counts[ck] += 1
+        record_index += 1
 
 doc.close()
 
@@ -230,7 +368,13 @@ with open(OUTPUT_PATH, 'w', encoding='utf-8') as f:
 執行 extract_pages.py 把 PDF 轉成 PNG 圖片：
 
 ```bash
-python3 ~/.claude/skills/pdf-ocr/extract_pages.py \
+python3 ~/.codex/skills/pdf-ocr/pdf_ocr_guard.py check-command -- \
+  python3 ~/.codex/skills/pdf-ocr/extract_pages.py \
+  "<PDF_PATH>" \
+  "<PNG_DIR>" \
+  --dpi <DPI>
+
+python3 ~/.codex/skills/pdf-ocr/extract_pages.py \
   "<PDF_PATH>" \
   "<PNG_DIR>" \
   --dpi <DPI>
@@ -239,9 +383,19 @@ python3 ~/.claude/skills/pdf-ocr/extract_pages.py \
 - `PNG_DIR` = 若進度中已有 `png_dir` 且目錄存在則沿用，否則用 `/tmp/pdf-ocr-<uuid4前8碼>/`
 - 腳本輸出最後三行包含 `TOTAL:<n>`、`EXTRACTED:<n>`、`OUT_DIR:<path>`
 
+渲染完成後立刻寫 manifest：
+
+```bash
+python3 ~/.codex/skills/pdf-ocr/pdf_ocr_guard.py write-manifest \
+  "<PDF_PATH>" \
+  "<OUTPUT_PATH>" \
+  --png-dir "<PNG_DIR>" \
+  --total-pages <TOTAL_PAGES>
+```
+
 > extract_pages.py 只負責 PDF→PNG 渲染（PyMuPDF 純圖像轉換），**不做任何 OCR**。
 
-非 `--resume` 時初始化進度結構（見 §進度結構）。`--resume` 則讀取既有 `PROGRESS_FILE`。
+非 `--resume` 時初始化進度結構（見 §進度結構）。`--resume` 則讀取既有 `PROGRESS_FILE`。進度檔不可保存整本 records，全文只寫入 `OUTPUT_PATH`。
 
 ---
 
@@ -250,12 +404,14 @@ python3 ~/.claude/skills/pdf-ocr/extract_pages.py \
 ```
 已完成 = PROGRESS.completed_pages（整數 list，0-based）
 待處理 = sorted([i for i in range(TOTAL_PAGES) if i not in 已完成])
-本次 batch = 待處理[:BATCH_SIZE]
+本次 batch = 待處理[:BATCH_SIZE]  # 預設 8，長時間任務不可超過 10
 ```
 
 若 `本次 batch` 為空 → 跳到 Step 5
 
 告知使用者：「本次處理第 {min+1}–{max+1} 頁（共 {len(batch)} 頁）...」
+
+若使用 subagent/fresh worker 模式，主 agent 在此步建立 worker 任務包，且 `fork_context:false`。主 agent 不處理頁面文字，也不等待 worker 貼全文，只接收短狀態回報。
 
 ---
 
@@ -296,6 +452,24 @@ python3 ~/.claude/skills/pdf-ocr/extract_pages.py \
 
 **裝飾性，應 SKIP**：純底色、章節分隔頁、封面封底、版權頁、作者照片風景照。
 
+SKIP 頁也必須 append 一筆 record：
+
+```json
+{
+  "record_index": 12,
+  "page_index": 5,
+  "page_number": 6,
+  "page_record_index": 0,
+  "loc": {"item_index": 2, "chunk_index": 0},
+  "chapter": "第二章：...",
+  "text": "",
+  "source": "llm_vision",
+  "page_sha256": "<sha256>",
+  "skip": true,
+  "skip_reason": "封面/空白/純裝飾"
+}
+```
+
 ### 3c. 切 chunks
 
 ≤ 500 字，優先在段落 `\n` 或句號 `。` 邊界切割。
@@ -304,23 +478,32 @@ python3 ~/.claude/skills/pdf-ocr/extract_pages.py \
 
 ```json
 {
+  "record_index": <global_record_index>,
+  "page_index": <page_idx>,
+  "page_number": <page_idx + 1>,
+  "page_record_index": <page_record_index>,
   "loc": {"item_index": <current_item_index>, "chunk_index": <ci>},
   "chapter": "<current_chapter>",
   "text": "<chunk_text>",
-  "source": "llm_vision"
+  "source": "llm_vision",
+  "page_sha256": "<manifest.pages[page_idx].page_sha256>"
 }
 ```
 
 **`source` 必填且必為 `"llm_vision"`**（§C 規則）。
+**頁序欄位必填且必須符合 §C2**。每 append 一筆前，先讀 `OUTPUT_PATH` 最後一筆確認下一個 `record_index`。
 
 ### 3e. 更新進度並立即存檔
 
-更新 `PROGRESS`：
+每頁完成後先 append records 到 `OUTPUT_PATH`，再更新 `PROGRESS`：
 - `completed_pages` 加入 `page_idx`
 - `current_chapter`、`current_item_index`、`item_chunk_counts` 更新
-- `records` 加入新 records
+- `last_record_index` 更新為最後一筆 `record_index`
+- `page_hashes[page_idx]` 記錄本頁 `page_sha256`
 
 立即寫入 `PROGRESS_FILE`（每頁完成都要存）。
+
+禁止把本頁全文貼回主對話；需要人工抽檢時，只讀 `OUTPUT_PATH` 的前 3 筆、末 3 筆或指定頁附近 records。
 
 ---
 
@@ -335,23 +518,24 @@ python3 ~/.claude/skills/pdf-ocr/extract_pages.py \
 
 ## Step 5：寫出 JSONL + 健全性檢查
 
-從 `PROGRESS.records` 寫出：
+LLM Vision 路徑採 append-only，Step 5 不再從 `PROGRESS.records` 重寫整本 JSONL。只做全檔驗證：
 
-```python
-import json
-records = json.load(open(PROGRESS_FILE))["records"]
-# §C 規則：每筆 source 必須是合法值
-LEGAL = {"llm_vision", "pdf_text_layer"}
-for r in records:
-    assert r.get("source") in LEGAL, f"違規 record：{r}"
-with open(OUTPUT_PATH, 'w', encoding='utf-8') as f:
-    for r in records:
-        f.write(json.dumps(r, ensure_ascii=False) + '\n')
+```bash
+python3 ~/.codex/skills/pdf-ocr/pdf_ocr_guard.py validate-jsonl "<OUTPUT_PATH>"
 ```
 
-assert 失敗即 §C 違規，整批作廢重做。
+若本批完成後尚未全書完成，也必須立即跑一次；這是 batch 邊界的硬性品質門檻。
+
+驗證失敗即 §C 違規，整批作廢重做。
 
 ### 5b. 輸出健全性快檢
+
+先執行 guard 驗證：
+
+```bash
+python3 ~/.codex/skills/pdf-ocr/pdf_ocr_guard.py validate-jsonl "<OUTPUT_PATH>"
+python3 ~/.codex/skills/pdf-ocr/pdf_ocr_guard.py finalize-audit "<OUTPUT_PATH>" --total-pages <TOTAL_PAGES>
+```
 
 寫出後讀回前 3 筆與隨機 3 筆，目視檢查：
 - 是否為連貫中文，而非「字 字 字」這類 OCR 引擎特徵亂碼
@@ -367,7 +551,7 @@ assert 失敗即 §C 違規，整批作廢重做。
 **若還有剩餘頁面**：
 ```
 ✅ 本次完成 {len(batch)} 頁（第 {start+1}–{end+1} 頁）
-📄 累計 {total_records} records，JSONL 已更新：{OUTPUT_PATH}
+📄 累計 {total_records} records，JSONL 已 append：{OUTPUT_PATH}
 📌 剩餘 {remaining} 頁，請執行：
    /pdf-ocr {PDF_PATH} --resume
 ```
@@ -378,11 +562,13 @@ assert 失敗即 §C 違規，整批作廢重做。
 # 1. 刪 PROGRESS_FILE
 rm -f "{OUTPUT_PATH}.ocr-progress.json"
 
-# 2. 刪 PNG 暫存目錄（僅 LLM Vision 路徑有此目錄）
-rm -rf "{PNG_DIR}"
+# 2. 若保留 PDF，才可刪 PNG 暫存；若要刪 PDF，先 archive PNG
+python3 ~/.codex/skills/pdf-ocr/pdf_ocr_guard.py deletion-gate \
+  "{OUTPUT_PATH}" \
+  --total-pages <TOTAL_PAGES> \
+  --keep-pages
 
-# 3. 確認沒殘留
-ls /tmp/pdf-ocr-* 2>/dev/null  # 應該不再有此次任務的目錄
+# 3. 依 deletion-gate 結果刪 PDF 或清理暫存
 ```
 
 回報：
@@ -392,7 +578,10 @@ ls /tmp/pdf-ocr-* 2>/dev/null  # 應該不再有此次任務的目錄
 🔧 路徑：{TYPE：text 直取 / 掃描型 LLM Vision}
 💾 輸出：{OUTPUT_PATH}
 ✅ 來源驗證：所有 record source ∈ {llm_vision, pdf_text_layer}
-🧹 暫存已清除：PROGRESS_FILE 與 PNG 目錄已刪
+✅ 順序驗證：record_index/page_index/page_record_index 全部連續
+✅ 覆蓋驗證：每一頁都有 record 或 skip record
+✅ 證據驗證：manifest/final-report/deletion-report hash chain 已保存
+🧹 暫存/證據保存策略已完成
 ➡️  下一步：「把 {OUTPUT_PATH} 做成 skill」
 ```
 
@@ -412,13 +601,15 @@ ls /tmp/pdf-ocr-* 2>/dev/null  # 應該不再有此次任務的目錄
   "current_chapter": "第一章：命宮",
   "current_item_index": 2,
   "item_chunk_counts": {"0": 3, "1": 2, "2": 1},
-  "records": [
-    {"loc": {"item_index": 0, "chunk_index": 0}, "chapter": "（前言）", "text": "...", "source": "llm_vision"}
-  ]
+  "last_record_index": 11,
+  "page_hashes": {"0": "<sha256>", "1": "<sha256>"},
+  "records_written": 12,
+  "last_completed_at": "2026-05-07T12:00:00+08:00",
+  "last_worker": "worker-id-or-session-note"
 }
 ```
 
-文字直取路徑一次跑完，不需要 progress 檔。
+文字直取路徑一次跑完，不需要 progress 檔。LLM Vision 路徑的 progress 檔只保存狀態；若發現 progress 內保存完整 records，必須先遷移為 append-only 再繼續。
 
 ---
 
