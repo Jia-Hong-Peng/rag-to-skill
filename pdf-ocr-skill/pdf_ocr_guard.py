@@ -41,6 +41,40 @@ BANNED_PATTERNS = [
     r"\bmcp__[^ \t\r\n]*image[^ \t\r\n]*\b",
     r"\bmcp__MiniMax__understand_image\b",
 ]
+SUBAGENT_REQUIRED_FIELDS = [
+    "PDF_PATH",
+    "OUTPUT_PATH",
+    "PROGRESS_FILE",
+    "PNG_DIR",
+    "PAGE_RANGE",
+    "NEXT_RECORD_INDEX",
+]
+PDF_OCR_SUBAGENT_MARKERS = [
+    "pdf-ocr",
+    "/pdf-ocr",
+    "llm_vision",
+    "llm vision",
+    "view_image",
+    "read png",
+    "png_dir",
+    "page_range",
+    "pdf_path",
+]
+FRESH_CONTEXT_MARKERS = [
+    "fork_context:false",
+    "fork_context: false",
+    "fork_context = false",
+    "forkcontext:false",
+    "fresh worker",
+    "fresh context",
+    "new context",
+    "blank context",
+    "全新上下文",
+    "空白上下文",
+    "不要 fork",
+    "不 fork",
+    "do not fork",
+]
 
 
 def fail(message: str) -> None:
@@ -53,6 +87,121 @@ def check_command(command: str) -> None:
         if re.search(pattern, command, flags=re.IGNORECASE):
             fail(f"禁止的 OCR/圖像工具命令: {pattern}")
     print("OK:command")
+
+
+def load_json_payload(path: Path | None) -> dict:
+    raw = path.read_text(encoding="utf-8") if path else sys.stdin.read()
+    if not raw.strip():
+        fail("subagent hook 沒有收到 JSON payload")
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        fail(f"subagent hook payload 不是合法 JSON: {exc}")
+    if not isinstance(payload, dict):
+        fail("subagent hook payload 必須是 JSON object")
+    return payload
+
+
+def walk_values(value):
+    if isinstance(value, dict):
+        for key, item in value.items():
+            yield key, item
+            yield from walk_values(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from walk_values(item)
+
+
+def collect_strings(value) -> list[str]:
+    strings: list[str] = []
+    if isinstance(value, str):
+        strings.append(value)
+    elif isinstance(value, dict):
+        for item in value.values():
+            strings.extend(collect_strings(item))
+    elif isinstance(value, list):
+        for item in value:
+            strings.extend(collect_strings(item))
+    return strings
+
+
+def normalized_text(payload: dict) -> str:
+    return "\n".join(collect_strings(payload)).lower().replace(" ", "")
+
+
+def subagent_payload_is_relevant(payload: dict) -> bool:
+    text = normalized_text(payload)
+    return any(marker.replace(" ", "") in text for marker in PDF_OCR_SUBAGENT_MARKERS)
+
+
+def has_false_fork_context(payload: dict) -> bool:
+    for key, value in walk_values(payload):
+        normalized_key = str(key).replace("_", "").replace("-", "").lower()
+        if normalized_key == "forkcontext" and value is False:
+            return True
+    text = normalized_text(payload)
+    return any(marker.replace(" ", "") in text for marker in FRESH_CONTEXT_MARKERS)
+
+
+def has_true_fork_context(payload: dict) -> bool:
+    for key, value in walk_values(payload):
+        normalized_key = str(key).replace("_", "").replace("-", "").lower()
+        if normalized_key == "forkcontext" and value is True:
+            return True
+    return bool(re.search(r"fork[_ -]?context[\"'\s:=]+true", normalized_text(payload)))
+
+
+def agent_type_values(payload: dict) -> list[str]:
+    values: list[str] = []
+    for key, value in walk_values(payload):
+        normalized_key = str(key).replace("_", "").replace("-", "").lower()
+        if normalized_key in {"agenttype", "subagenttype", "role"} and isinstance(value, str):
+            values.append(value.lower())
+    return values
+
+
+def validate_subagent_payload(payload: dict, require_relevance: bool) -> None:
+    relevant = subagent_payload_is_relevant(payload)
+    if not relevant and not require_relevance:
+        print("OK:subagent-hook:irrelevant")
+        return
+    if not relevant:
+        fail("subagent payload 不像 pdf-ocr LLM Vision worker 任務包")
+
+    text = normalized_text(payload)
+    errors: list[str] = []
+    if has_true_fork_context(payload):
+        errors.append("fork_context=true 會攜帶主對話上下文，必須改成 fork_context:false")
+    if not has_false_fork_context(payload):
+        errors.append("缺少 fresh/blank context 證據；任務包必須明確包含 fork_context:false 或全新上下文要求")
+
+    types = agent_type_values(payload)
+    if types and "worker" not in types:
+        errors.append(f"agent_type/subagent role 必須是 worker，目前是 {types!r}")
+    if not types and "worker" not in text:
+        errors.append("缺少 worker 角色標記")
+
+    missing = [field for field in SUBAGENT_REQUIRED_FIELDS if field.lower() not in text]
+    if missing:
+        errors.append(f"worker 任務包缺少必要欄位: {', '.join(missing)}")
+
+    if not ("禁止" in text or "ban" in text or "forbid" in text):
+        errors.append("任務包必須明確禁止 Tesseract/Paddle/EasyOCR/雲端 OCR/MCP 圖像工具")
+    for banned in ("tesseract", "paddle", "easyocr", "mcp"):
+        if banned not in text:
+            errors.append(f"任務包缺少禁止項提示: {banned}")
+
+    if "不要貼全文" not in text and "不要貼全文" not in "\n".join(collect_strings(payload)):
+        if "do not paste full text" not in text and "don't paste full text" not in text:
+            errors.append("任務包必須要求 worker 回覆短狀態，不貼全文")
+
+    task_text_bytes = sum(len(s.encode("utf-8")) for s in collect_strings(payload))
+    if task_text_bytes > 20000:
+        errors.append("subagent 任務包過大，疑似夾帶主上下文；請只傳必要任務包")
+
+    if errors:
+        fail("；".join(errors))
+    print("OK:subagent-worker-fresh")
 
 
 def first_jsonl_record(path: Path) -> dict | None:
@@ -81,6 +230,36 @@ def validate_existing_jsonl(path: Path, strict_missing: bool) -> None:
             fail(f"{path} 第一筆缺少 source，必須人工確認後才可沿用")
         fail(f"{path} 第一筆 source={source!r} 不合法，視為已污染，不可 --resume")
     print("OK:jsonl-source")
+
+
+def likely_existing_outputs(pdf_path: Path, output_path: Path) -> list[Path]:
+    """Find user-created JSONL outputs that should prevent duplicate OCR work."""
+    candidates = {
+        pdf_path.with_suffix(".jsonl"),
+        pdf_path.parent / f"{pdf_path.name}.jsonl",
+    }
+    normalized_output = output_path.resolve()
+    existing = []
+    for candidate in candidates:
+        if candidate.exists() and candidate.resolve() != normalized_output:
+            existing.append(candidate)
+    return sorted(existing)
+
+
+def check_duplicate_output(pdf_path: Path, output_path: Path, force: bool) -> None:
+    if not pdf_path.exists():
+        fail(f"找不到 PDF: {pdf_path}")
+    existing = likely_existing_outputs(pdf_path, output_path)
+    if existing and not force:
+        details = ", ".join(str(path) for path in existing)
+        fail(
+            "偵測到 PDF 同目錄已有可能完成的 JSONL，禁止在其他輸出目錄重做以免浪費 token。"
+            f"既有 JSONL: {details}；若確認要重做，必須明確使用 --force-duplicate-output"
+        )
+    if existing:
+        print(f"OK:duplicate-output-forced:{','.join(str(path) for path in existing)}")
+    else:
+        print("OK:no-duplicate-output")
 
 
 def validate_jsonl(path: Path) -> None:
@@ -424,6 +603,11 @@ def main() -> None:
     p_existing.add_argument("path", type=Path)
     p_existing.add_argument("--allow-missing-source", action="store_true")
 
+    p_duplicate = sub.add_parser("check-duplicate-output")
+    p_duplicate.add_argument("pdf_path", type=Path)
+    p_duplicate.add_argument("output_path", type=Path)
+    p_duplicate.add_argument("--force-duplicate-output", action="store_true")
+
     p_validate = sub.add_parser("validate-jsonl")
     p_validate.add_argument("path", type=Path)
 
@@ -462,11 +646,18 @@ def main() -> None:
     p_delete.add_argument("--keep-pages", action="store_true")
     p_delete.add_argument("--overwrite", action="store_true")
 
+    sub.add_parser("check-subagent-hook")
+
+    p_subagent_payload = sub.add_parser("check-subagent-payload")
+    p_subagent_payload.add_argument("payload_json", type=Path)
+
     args = parser.parse_args()
     if args.cmd == "check-command":
         check_command(" ".join(args.command))
     elif args.cmd == "check-existing-jsonl":
         validate_existing_jsonl(args.path, strict_missing=not args.allow_missing_source)
+    elif args.cmd == "check-duplicate-output":
+        check_duplicate_output(args.pdf_path, args.output_path, args.force_duplicate_output)
     elif args.cmd == "validate-jsonl":
         validate_jsonl(args.path)
     elif args.cmd == "check-single-book":
@@ -483,6 +674,10 @@ def main() -> None:
         finalize_audit(args.output_path, args.total_pages, args.overwrite)
     elif args.cmd == "deletion-gate":
         deletion_gate(args.output_path, args.total_pages, args.keep_pdf, args.keep_pages, args.overwrite)
+    elif args.cmd == "check-subagent-hook":
+        validate_subagent_payload(load_json_payload(None), require_relevance=False)
+    elif args.cmd == "check-subagent-payload":
+        validate_subagent_payload(load_json_payload(args.payload_json), require_relevance=True)
 
 
 if __name__ == "__main__":

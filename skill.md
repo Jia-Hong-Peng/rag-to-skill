@@ -36,6 +36,8 @@ description: |
 
 若無現成 JSONL，先用以下工具轉換，再回來：
 
+**重要：若來源檔同目錄已存在同名 `.jsonl`，預設必須直接使用既有 JSONL，不可另轉一份到 `ocr-jsonl/` 或其他集中目錄。** 只有使用者明確要求重做或覆蓋時，才可重新轉換；重新轉換前必須先說明會耗費 token/時間，並保留舊檔。
+
 | 工具 | 支援格式 | 指令 |
 |---|---|---|
 | `any_to_jsonl.py` | **萬用**（PDF / EPUB / DOCX / PPTX / HTML...） | `python3 any_to_jsonl.py <file>` |

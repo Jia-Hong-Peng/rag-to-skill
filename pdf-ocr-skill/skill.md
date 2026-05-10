@@ -17,6 +17,17 @@ description: |
   - /pdf-ocr /path/to/book.pdf /path/to/output.jsonl
   - /pdf-ocr /path/to/book.pdf --resume
   - /pdf-ocr /path/to/book.pdf --batch 8 --dpi 120
+hooks:
+  TaskCreated:
+    - hooks:
+        - type: command
+          command: 'python3 "${CLAUDE_SKILL_DIR}/pdf_ocr_guard.py" check-subagent-hook'
+          statusMessage: "Checking pdf-ocr worker isolation..."
+  SubagentStart:
+    - hooks:
+        - type: command
+          command: 'python3 "${CLAUDE_SKILL_DIR}/pdf_ocr_guard.py" check-subagent-hook'
+          statusMessage: "Checking pdf-ocr worker isolation..."
 ---
 
 # PDF → JSONL（智慧路由：文字型直取 / 掃描型 LLM Vision）
@@ -39,15 +50,19 @@ description: |
 | 檢查點 | 必跑指令 | 目的 |
 |---|---|---|
 | 啟動前 | `python3 ~/.codex/skills/pdf-ocr/pdf_ocr_guard.py check-single-book --current-output "<OUTPUT_PATH>"` | 阻止同時處理多本書 |
+| 啟動前 | `python3 ~/.codex/skills/pdf-ocr/pdf_ocr_guard.py check-duplicate-output "<PDF_PATH>" "<OUTPUT_PATH>"` | 阻止同一本 PDF 已有同名 JSONL 卻在 `ocr-jsonl/` 另做一份 |
 | 啟動/續跑前 | `python3 ~/.codex/skills/pdf-ocr/pdf_ocr_guard.py check-existing-jsonl "<OUTPUT_PATH>"` | 阻止沿用污染 JSONL |
 | 續跑前 | `python3 ~/.codex/skills/pdf-ocr/pdf_ocr_guard.py validate-progress "<PROGRESS_FILE>"` | 阻止沿用高上下文舊 progress |
 | 每次準備執行 shell 命令前 | `python3 ~/.codex/skills/pdf-ocr/pdf_ocr_guard.py check-command -- <COMMAND...>` | 阻止 Tesseract/Paddle/EasyOCR/雲端 OCR/MCP 圖像工具 |
+| 建立 worker subagent 時 | `python3 ~/.codex/skills/pdf-ocr/pdf_ocr_guard.py check-subagent-hook` | 阻止非 fresh worker、fork 主上下文或缺少任務包的 OCR subagent |
 | 渲染後 | `python3 ~/.codex/skills/pdf-ocr/pdf_ocr_guard.py write-manifest "<PDF_PATH>" "<OUTPUT_PATH>" --png-dir "<PNG_DIR>"` | 保存 PDF/頁圖 SHA256 證據 |
 | 寫出 JSONL 後 | `python3 ~/.codex/skills/pdf-ocr/pdf_ocr_guard.py validate-jsonl "<OUTPUT_PATH>"` | 驗證 source、頁序、record 序 |
 | 完成前 | `python3 ~/.codex/skills/pdf-ocr/pdf_ocr_guard.py finalize-audit "<OUTPUT_PATH>" --total-pages <TOTAL>` | 產生 final hash chain |
 | 刪 PDF 前 | `python3 ~/.codex/skills/pdf-ocr/pdf_ocr_guard.py deletion-gate "<OUTPUT_PATH>" --total-pages <TOTAL> --keep-pages` | 確認可刪 PDF 的條件 |
 
 Claude Code 安裝位置若是 `~/.claude/skills/pdf-ocr/`，同一套指令改用該路徑。
+
+Claude Code 會透過本 skill frontmatter 的 `TaskCreated` / `SubagentStart` hook 自動執行 `check-subagent-hook`。Codex CLI 0.128 的 lifecycle hooks 目前不攔截 `spawn_agent` 建立事件；Codex 執行本 skill 時仍必須使用 `spawn_agent(..., fork_context:false, agent_type:"worker")`，並可用 `check-subagent-payload` 驗證任務包。
 
 ### A. 永不允許的辨識方式
 
@@ -111,6 +126,29 @@ Claude Code 安裝位置若是 `~/.claude/skills/pdf-ocr/`，同一套指令改�
 每頁即使 SKIP，也要寫一筆 `skip:true` record，包含 `skip_reason`、`page_index`、`page_number`、`page_sha256`。這樣 `validate-coverage` 才能證明整本每一頁都被看過。
 
 ### D. 既有 JSONL 完整性檢查（Step 0 強制執行）
+
+#### D0. 目錄批次處理的既有成果優先規則
+
+處理整個資料夾時，必須先掃描每個 PDF 同目錄是否已有同名 JSONL：
+
+- 對 `/path/book.pdf`，若 `/path/book.jsonl` 已存在，預設視為已完成成果，必須跳過該 PDF。
+- 不可因為要把輸出集中到 `ocr-jsonl/`，就另建 `/path/ocr-jsonl/.../book.pdf.jsonl` 重做同一本書。
+- 若既有 JSONL 的 schema 不同於 pdf-ocr 新 schema，仍不可直接重做；必須回報使用者「已有舊成果，需要轉換/標準化或明確重做」。
+- 只有使用者明確指定「重做、覆蓋、忽略原 JSONL」時，才能用新輸出路徑；並且要先說明會消耗 token。
+
+啟動 OCR 前必跑：
+
+```bash
+python3 ~/.codex/skills/pdf-ocr/pdf_ocr_guard.py check-duplicate-output \
+  "<PDF_PATH>" "<OUTPUT_PATH>"
+```
+
+若要明確重做，必須使用：
+
+```bash
+python3 ~/.codex/skills/pdf-ocr/pdf_ocr_guard.py check-duplicate-output \
+  "<PDF_PATH>" "<OUTPUT_PATH>" --force-duplicate-output
+```
 
 執行 `--resume` 或對既有 JSONL 重做時，必須先：
 
@@ -214,6 +252,12 @@ NEXT_RECORD_INDEX=<從 OUTPUT_PATH 最後一筆 + 1 得出>
 
 Codex 可用 `spawn_agent`，設定 `fork_context:false`，agent type 用 `worker`；Claude Code 若沒有等效能力，則用短 batch + `--resume` 重啟新會話達到同樣目的。
 
+建立 worker 前若平台沒有自動 Task/Subagent hook，先把即將送出的任務包寫成 JSON 後執行：
+
+```bash
+python3 ~/.codex/skills/pdf-ocr/pdf_ocr_guard.py check-subagent-payload "<TASK_PAYLOAD_JSON>"
+```
+
 ### I. 原始資料保存與刪除限制
 
 **在 JSONL 完成後立刻刪 PDF 是高風險操作，預設禁止。** 因為 JSONL 是衍生資料，不等同原始掃描證據。若真的需要刪除 PDF，必須先完成以下全部條件：
@@ -267,12 +311,17 @@ Codex 可用 `spawn_agent`，設定 `fork_context:false`，agent type 用 `worke
    python3 ~/.codex/skills/pdf-ocr/pdf_ocr_guard.py check-single-book --current-output "<OUTPUT_PATH>"
    ```
    若有未完成任務 → 依 §F 處理
-4. **Guard：既有 JSONL 完整性驗證**：
+4. **Guard：同名既有成果檢查**：
+   ```bash
+   python3 ~/.codex/skills/pdf-ocr/pdf_ocr_guard.py check-duplicate-output "<PDF_PATH>" "<OUTPUT_PATH>"
+   ```
+   若 PDF 同目錄已有 `<PDF_STEM>.jsonl`，必須跳過或請使用者明確確認重做，不可另輸出到 `ocr-jsonl/` 製造重複成果。
+5. **Guard：既有 JSONL 完整性驗證**：
    ```bash
    python3 ~/.codex/skills/pdf-ocr/pdf_ocr_guard.py check-existing-jsonl "<OUTPUT_PATH>"
    ```
    若 `OUTPUT_PATH` 已存在且 `source` 不合法，視為污染，不可 `--resume`
-5. **Guard：progress 狀態檔驗證**：
+6. **Guard：progress 狀態檔驗證**：
    ```bash
    python3 ~/.codex/skills/pdf-ocr/pdf_ocr_guard.py validate-progress "<OUTPUT_PATH>.ocr-progress.json"
    ```
